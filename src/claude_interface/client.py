@@ -5,6 +5,7 @@ The primary interface for interacting with Claude via OAuth or API key.
 Handles authentication, sessions, logging, and memory.
 """
 
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -22,6 +23,12 @@ from .types import (
     Usage,
     RequestPayload,
     ResponsePayload,
+    ImageInput,
+    ImageContent,
+    TextContent,
+    Tool,
+    ToolCall,
+    ToolParameter,
 )
 from .auth import is_expired, is_oauth_token, refresh_token
 from .session import SessionManager
@@ -90,8 +97,14 @@ class ClaudeClient:
         self._oauth_credentials = auth.oauth
         self._current_session_id: str | None = None
         
+        # Lock for thread-safe session operations
+        self._session_lock = asyncio.Lock()
+        
         self._session_manager = SessionManager(str(self._storage_dir))
         self._logger = Logger(str(self._storage_dir))
+        
+        # Tool registry
+        self._tools: dict[str, Tool] = {}
     
     # ─────────────────────────────────────────────────────────────────────────
     # Authentication
@@ -158,6 +171,89 @@ class ClaudeClient:
         self._client = None  # Force client recreation
     
     # ─────────────────────────────────────────────────────────────────────────
+    # Tool Management
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def register_tool(self, tool: Tool) -> None:
+        """
+        Register a tool that Claude can use.
+        
+        Example:
+            ```python
+            async def get_weather(location: str) -> str:
+                return f"Weather in {location}: Sunny, 72°F"
+            
+            client.register_tool(Tool(
+                name="get_weather",
+                description="Get the current weather for a location",
+                parameters=[
+                    ToolParameter(name="location", type="string", description="City name"),
+                ],
+                handler=get_weather,
+            ))
+            ```
+        """
+        self._tools[tool.name] = tool
+    
+    def unregister_tool(self, name: str) -> bool:
+        """Unregister a tool by name."""
+        if name in self._tools:
+            del self._tools[name]
+            return True
+        return False
+    
+    def list_tools(self) -> list[Tool]:
+        """List all registered tools."""
+        return list(self._tools.values())
+    
+    def _get_tools_for_api(self) -> list[dict[str, Any]] | None:
+        """Convert registered tools to Anthropic API format."""
+        if not self._tools:
+            return None
+        
+        tools = []
+        for tool in self._tools.values():
+            properties = {}
+            required = []
+            
+            for param in tool.parameters:
+                prop = {"type": param.type, "description": param.description}
+                if param.enum:
+                    prop["enum"] = param.enum
+                properties[param.name] = prop
+                
+                if param.required:
+                    required.append(param.name)
+            
+            tools.append({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            })
+        
+        return tools
+    
+    async def _execute_tool(self, tool_call: ToolCall) -> str:
+        """Execute a tool and return the result."""
+        tool = self._tools.get(tool_call.name)
+        if not tool or not tool.handler:
+            return f"Error: Tool '{tool_call.name}' not found or has no handler"
+        
+        try:
+            # Check if handler is async
+            if asyncio.iscoroutinefunction(tool.handler):
+                result = await tool.handler(**tool_call.input)
+            else:
+                result = tool.handler(**tool_call.input)
+            return str(result)
+        except Exception as e:
+            return f"Error executing tool: {e}"
+    
+    # ─────────────────────────────────────────────────────────────────────────
     # Session Management
     # ─────────────────────────────────────────────────────────────────────────
     
@@ -207,15 +303,6 @@ class ClaudeClient:
         Spin out a thought/topic into a new session.
         
         Creates a new session with context from the current conversation.
-        
-        Example:
-            ```python
-            new_session = await client.spin_out(SpinOutOptions(
-                topic="TypeScript best practices",
-                include_last_n=4,
-                system_prompt="Focus on TypeScript patterns discussed earlier.",
-            ))
-            ```
         """
         current_session = self.get_current_session()
         if not current_session:
@@ -341,37 +428,17 @@ class ClaudeClient:
         return self._logger.get_stats(id)
     
     # ─────────────────────────────────────────────────────────────────────────
-    # Core API
+    # Helper: Build System Prompt
     # ─────────────────────────────────────────────────────────────────────────
     
-    async def send(
+    def _build_system_prompt(
         self,
-        content: str,
-        model: str | None = None,
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-        system_prompt: str | None = None,
-    ) -> SendResult:
-        """Send a message and get a response."""
-        session = self.get_current_session()
-        if not session:
-            raise ValueError("No active session. Create or load a session first.")
-        
-        client = await self._get_client()
-        model = model or self._model
-        max_tokens = max_tokens or self._max_tokens
-        is_oauth = is_oauth_token(self._get_auth_token())
-        
-        # Add user message to session
-        user_message = Message(
-            role="user",
-            content=content,
-            timestamp=int(time.time() * 1000),
-        )
-        self._session_manager.add_message(session.id, user_message)
-        
-        # Build system prompt
-        sys_prompt = system_prompt or session.system_prompt or ""
+        session: Session,
+        override: str | None,
+        is_oauth: bool,
+    ) -> str:
+        """Build system prompt with memory context."""
+        sys_prompt = override or session.system_prompt or ""
         
         # For OAuth, prepend required Claude Code identity
         if is_oauth and "Claude Code" not in sys_prompt:
@@ -382,11 +449,131 @@ class ClaudeClient:
         if memory and memory.count() > 0:
             sys_prompt += "\n\n" + memory.format_as_context()
         
+        return sys_prompt
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Helper: Build Message Content
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def _build_content(
+        self,
+        text: str,
+        images: list[ImageInput] | None = None,
+    ) -> str | list[dict[str, Any]]:
+        """Build message content, optionally with images."""
+        if not images:
+            return text
+        
+        # Build content blocks
+        content: list[dict[str, Any]] = []
+        
+        # Add text first
+        if text:
+            content.append({"type": "text", "text": text})
+        
+        # Add images
+        for img in images:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": img.data,
+                },
+            })
+        
+        return content
+    
+    def _convert_messages_for_api(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Convert messages to API format, handling images."""
+        result = []
+        for m in messages:
+            if isinstance(m.content, str):
+                result.append({"role": m.role, "content": m.content})
+            else:
+                # Convert content blocks
+                blocks = []
+                for block in m.content:
+                    if isinstance(block, TextContent):
+                        blocks.append({"type": "text", "text": block.text})
+                    elif isinstance(block, ImageContent):
+                        blocks.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": block.media_type,
+                                "data": block.data,
+                            },
+                        })
+                result.append({"role": m.role, "content": blocks})
+        return result
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Core API
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    async def send(
+        self,
+        content: str,
+        images: list[ImageInput] | None = None,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        system_prompt: str | None = None,
+        auto_execute_tools: bool = True,
+    ) -> SendResult:
+        """
+        Send a message and get a response.
+        
+        Args:
+            content: Text content to send
+            images: Optional list of images to include
+            model: Override model for this request
+            max_tokens: Override max tokens
+            temperature: Override temperature
+            system_prompt: Override system prompt
+            auto_execute_tools: Automatically execute tool calls and continue
+        """
+        session = self.get_current_session()
+        if not session:
+            raise ValueError("No active session. Create or load a session first.")
+        
+        client = await self._get_client()
+        model = model or self._model
+        max_tokens = max_tokens or self._max_tokens
+        is_oauth = is_oauth_token(self._get_auth_token())
+        
+        # Build message content
+        message_content = self._build_content(content, images)
+        
+        # Add user message to session (with lock for thread safety)
+        async with self._session_lock:
+            # Store as proper content blocks if we have images
+            if images:
+                blocks = [TextContent(text=content)] if content else []
+                for img in images:
+                    blocks.append(ImageContent(
+                        media_type=img.media_type,
+                        data=img.data,
+                    ))
+                user_message = Message(
+                    role="user",
+                    content=blocks,
+                    timestamp=int(time.time() * 1000),
+                )
+            else:
+                user_message = Message(
+                    role="user",
+                    content=content,
+                    timestamp=int(time.time() * 1000),
+                )
+            self._session_manager.add_message(session.id, user_message)
+        
+        # Build system prompt with memory
+        sys_prompt = self._build_system_prompt(session, system_prompt, is_oauth)
+        
         # Build messages for API
-        messages = [
-            {"role": m.role, "content": m.content}
-            for m in session.messages
-        ]
+        messages = self._convert_messages_for_api(session.messages)
         
         # Log request
         request_id = ""
@@ -424,24 +611,38 @@ class ClaudeClient:
             elif self._temperature is not None:
                 params["temperature"] = self._temperature
             
+            # Add tools if registered
+            tools = self._get_tools_for_api()
+            if tools:
+                params["tools"] = tools
+            
             # Make API call
             response = await client.messages.create(**params)
             
             duration_ms = int((time.time() - start_time) * 1000)
             
-            # Extract text content
-            response_text = "".join(
-                block.text for block in response.content
-                if hasattr(block, "text")
-            )
+            # Extract content and tool calls
+            response_text = ""
+            tool_calls = []
+            
+            for block in response.content:
+                if hasattr(block, "text"):
+                    response_text += block.text
+                elif block.type == "tool_use":
+                    tool_calls.append(ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        input=block.input,
+                    ))
             
             # Add assistant message to session
-            assistant_message = Message(
-                role="assistant",
-                content=response_text,
-                timestamp=int(time.time() * 1000),
-            )
-            self._session_manager.add_message(session.id, assistant_message)
+            async with self._session_lock:
+                assistant_message = Message(
+                    role="assistant",
+                    content=response_text,
+                    timestamp=int(time.time() * 1000),
+                )
+                self._session_manager.add_message(session.id, assistant_message)
             
             # Build result
             usage = Usage(
@@ -457,6 +658,7 @@ class ClaudeClient:
                 usage=usage,
                 duration_ms=duration_ms,
                 model=response.model,
+                tool_calls=tool_calls,
             )
             
             # Update session metadata
@@ -480,6 +682,12 @@ class ClaudeClient:
                     duration_ms,
                 )
             
+            # Auto-execute tools if requested
+            if auto_execute_tools and tool_calls and result.stop_reason == "tool_use":
+                return await self._execute_tools_and_continue(
+                    tool_calls, model, max_tokens, temperature, sys_prompt
+                )
+            
             return result
             
         except Exception as e:
@@ -498,9 +706,120 @@ class ClaudeClient:
                 )
             raise
     
+    async def _execute_tools_and_continue(
+        self,
+        tool_calls: list[ToolCall],
+        model: str,
+        max_tokens: int,
+        temperature: float | None,
+        system_prompt: str,
+    ) -> SendResult:
+        """Execute tool calls and continue the conversation."""
+        session = self.get_current_session()
+        if not session:
+            raise ValueError("No active session")
+        
+        client = await self._get_client()
+        
+        # Execute each tool
+        tool_results = []
+        for tc in tool_calls:
+            result = await self._execute_tool(tc)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tc.id,
+                "content": result,
+            })
+        
+        # Add tool results as user message
+        messages = self._convert_messages_for_api(session.messages)
+        
+        # Add the assistant's tool use message
+        messages.append({
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": tc.id, "name": tc.name, "input": tc.input}
+                for tc in tool_calls
+            ],
+        })
+        
+        # Add tool results
+        messages.append({
+            "role": "user",
+            "content": tool_results,
+        })
+        
+        # Continue conversation
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        
+        if system_prompt:
+            params["system"] = [{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        
+        if temperature is not None:
+            params["temperature"] = temperature
+        
+        tools = self._get_tools_for_api()
+        if tools:
+            params["tools"] = tools
+        
+        start_time = time.time()
+        response = await client.messages.create(**params)
+        duration_ms = int((time.time() - start_time) * 1000)
+        
+        # Extract response
+        response_text = ""
+        new_tool_calls = []
+        
+        for block in response.content:
+            if hasattr(block, "text"):
+                response_text += block.text
+            elif block.type == "tool_use":
+                new_tool_calls.append(ToolCall(
+                    id=block.id,
+                    name=block.name,
+                    input=block.input,
+                ))
+        
+        # Add assistant message
+        async with self._session_lock:
+            self._session_manager.add_message(session.id, Message(
+                role="assistant",
+                content=response_text,
+                timestamp=int(time.time() * 1000),
+            ))
+        
+        result = SendResult(
+            content=response_text,
+            stop_reason=self._map_stop_reason(response.stop_reason),
+            usage=Usage(
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            ),
+            duration_ms=duration_ms,
+            model=response.model,
+            tool_calls=new_tool_calls,
+        )
+        
+        # Recursively handle more tool calls
+        if new_tool_calls and result.stop_reason == "tool_use":
+            return await self._execute_tools_and_continue(
+                new_tool_calls, model, max_tokens, temperature, system_prompt
+            )
+        
+        return result
+    
     async def stream(
         self,
         content: str,
+        images: list[ImageInput] | None = None,
         model: str | None = None,
         max_tokens: int | None = None,
         temperature: float | None = None,
@@ -516,23 +835,24 @@ class ClaudeClient:
         max_tokens = max_tokens or self._max_tokens
         is_oauth = is_oauth_token(self._get_auth_token())
         
-        # Add user message
-        user_message = Message(
-            role="user",
-            content=content,
-            timestamp=int(time.time() * 1000),
-        )
-        self._session_manager.add_message(session.id, user_message)
+        # Build message content
+        message_content = self._build_content(content, images)
         
-        # Build system prompt
-        sys_prompt = system_prompt or session.system_prompt or ""
-        if is_oauth and "Claude Code" not in sys_prompt:
-            sys_prompt = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + sys_prompt
+        # Add user message (with lock)
+        async with self._session_lock:
+            if images:
+                blocks = [TextContent(text=content)] if content else []
+                for img in images:
+                    blocks.append(ImageContent(media_type=img.media_type, data=img.data))
+                user_message = Message(role="user", content=blocks, timestamp=int(time.time() * 1000))
+            else:
+                user_message = Message(role="user", content=content, timestamp=int(time.time() * 1000))
+            self._session_manager.add_message(session.id, user_message)
         
-        messages = [
-            {"role": m.role, "content": m.content}
-            for m in session.messages
-        ]
+        # Build system prompt WITH MEMORY (fix for Copilot issue)
+        sys_prompt = self._build_system_prompt(session, system_prompt, is_oauth)
+        
+        messages = self._convert_messages_for_api(session.messages)
         
         start_time = time.time()
         full_content = ""
@@ -553,6 +873,11 @@ class ClaudeClient:
                     "cache_control": {"type": "ephemeral"},
                 }]
             
+            if temperature is not None:
+                params["temperature"] = temperature
+            elif self._temperature is not None:
+                params["temperature"] = self._temperature
+            
             async with client.messages.stream(**params) as stream:
                 async for event in stream:
                     if hasattr(event, "type"):
@@ -565,12 +890,13 @@ class ClaudeClient:
             
             duration_ms = int((time.time() - start_time) * 1000)
             
-            # Add assistant message
-            self._session_manager.add_message(session.id, Message(
-                role="assistant",
-                content=full_content,
-                timestamp=int(time.time() * 1000),
-            ))
+            # Add assistant message (with lock)
+            async with self._session_lock:
+                self._session_manager.add_message(session.id, Message(
+                    role="assistant",
+                    content=full_content,
+                    timestamp=int(time.time() * 1000),
+                ))
             
             result = SendResult(
                 content=full_content,

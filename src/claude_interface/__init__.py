@@ -18,6 +18,13 @@ Example:
     client.create_session(name="Code Review")
     result = await client.send("Review this code...")
     print(result.content)
+    
+    # Send with image
+    from claude_interface import ImageInput
+    result = await client.send(
+        "What's in this image?",
+        images=[ImageInput.from_file("photo.png")],
+    )
     ```
 """
 
@@ -35,6 +42,13 @@ from .types import (
     TextContent,
     ImageContent,
     ContentBlock,
+    # Images
+    ImageInput,
+    # Tools
+    Tool,
+    ToolParameter,
+    ToolCall,
+    ToolResult,
     # Session
     Session,
     SessionSummary,
@@ -83,6 +97,13 @@ __all__ = [
     "TextContent",
     "ImageContent",
     "ContentBlock",
+    # Images
+    "ImageInput",
+    # Tools
+    "Tool",
+    "ToolParameter",
+    "ToolCall",
+    "ToolResult",
     # Client
     "SendResult",
     "SpinOutOptions",

@@ -3,7 +3,7 @@ Claude Interface - Type Definitions
 """
 
 from dataclasses import dataclass, field
-from typing import Literal, Any
+from typing import Literal, Any, Callable, Awaitable
 from enum import Enum
 
 
@@ -60,6 +60,46 @@ class Message:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tool Types
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ToolParameter:
+    """A parameter for a tool."""
+    name: str
+    type: str  # "string", "number", "boolean", "array", "object"
+    description: str
+    required: bool = True
+    enum: list[str] | None = None
+    default: Any = None
+
+
+@dataclass
+class Tool:
+    """A tool that Claude can use."""
+    name: str
+    description: str
+    parameters: list[ToolParameter] = field(default_factory=list)
+    handler: Callable[..., Awaitable[str]] | Callable[..., str] | None = None
+
+
+@dataclass
+class ToolCall:
+    """A tool call from Claude."""
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass
+class ToolResult:
+    """Result of executing a tool."""
+    tool_call_id: str
+    content: str
+    is_error: bool = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Memory Types
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -90,6 +130,7 @@ class Session:
     messages: list[Message] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     memory: list[MemoryEntry] = field(default_factory=list)
+    tools: list[Tool] = field(default_factory=list)
     created_at: int = 0
     updated_at: int = 0
 
@@ -159,6 +200,7 @@ class SendResult:
     usage: Usage
     duration_ms: int
     model: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 @dataclass
@@ -175,3 +217,59 @@ class SpinOutOptions:
     memory_tags: list[str] | None = None
     initial_prompt: str | None = None
     switch_to: bool = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image Helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ImageInput:
+    """Helper for creating image content."""
+    data: str  # Base64 encoded or file path
+    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/png"
+    
+    @classmethod
+    def from_file(cls, path: str) -> "ImageInput":
+        """Create ImageInput from a file path."""
+        import base64
+        from pathlib import Path
+        
+        file_path = Path(path)
+        suffix = file_path.suffix.lower()
+        
+        media_type_map = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+        
+        media_type = media_type_map.get(suffix, "image/png")
+        
+        with open(file_path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("utf-8")
+        
+        return cls(data=data, media_type=media_type)
+    
+    @classmethod
+    def from_base64(cls, data: str, media_type: str = "image/png") -> "ImageInput":
+        """Create ImageInput from base64 data."""
+        return cls(data=data, media_type=media_type)
+    
+    @classmethod
+    def from_url(cls, url: str) -> "ImageInput":
+        """Create ImageInput from a URL (downloads the image)."""
+        import base64
+        import httpx
+        
+        response = httpx.get(url)
+        response.raise_for_status()
+        
+        content_type = response.headers.get("content-type", "image/png")
+        if ";" in content_type:
+            content_type = content_type.split(";")[0].strip()
+        
+        data = base64.b64encode(response.content).decode("utf-8")
+        return cls(data=data, media_type=content_type)

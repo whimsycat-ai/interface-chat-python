@@ -122,6 +122,93 @@ async for event in client.stream("Explain async/await"):
             print(f"Error: {event['error']}")
 ```
 
+### Image Support
+
+Send images with your messages:
+
+```python
+from claude_interface import ImageInput
+
+# From file
+result = await client.send(
+    "What's in this image?",
+    images=[ImageInput.from_file("photo.png")],
+)
+
+# From URL
+result = await client.send(
+    "Describe this",
+    images=[ImageInput.from_url("https://example.com/image.jpg")],
+)
+
+# From base64
+result = await client.send(
+    "Analyze this",
+    images=[ImageInput.from_base64(base64_data, "image/png")],
+)
+
+# Multiple images
+result = await client.send(
+    "Compare these two images",
+    images=[
+        ImageInput.from_file("before.png"),
+        ImageInput.from_file("after.png"),
+    ],
+)
+```
+
+### Tool Support
+
+Register tools that Claude can use:
+
+```python
+from claude_interface import Tool, ToolParameter
+
+# Define a tool
+async def get_weather(location: str, units: str = "celsius") -> str:
+    # Your implementation here
+    return f"Weather in {location}: Sunny, 22°{units[0].upper()}"
+
+# Register it
+client.register_tool(Tool(
+    name="get_weather",
+    description="Get the current weather for a location",
+    parameters=[
+        ToolParameter(
+            name="location",
+            type="string",
+            description="City name",
+            required=True,
+        ),
+        ToolParameter(
+            name="units",
+            type="string",
+            description="Temperature units",
+            required=False,
+            enum=["celsius", "fahrenheit"],
+            default="celsius",
+        ),
+    ],
+    handler=get_weather,
+))
+
+# Claude can now use the tool automatically
+result = await client.send("What's the weather in Paris?")
+# Tool is auto-executed, result includes the weather info
+
+# List registered tools
+tools = client.list_tools()
+
+# Disable auto-execution if you want to handle tools yourself
+result = await client.send(
+    "What's the weather?",
+    auto_execute_tools=False,
+)
+if result.tool_calls:
+    for tc in result.tool_calls:
+        print(f"Tool: {tc.name}, Input: {tc.input}")
+```
+
 ### Spin Out Thoughts
 
 Create a new focused session from part of an existing conversation:

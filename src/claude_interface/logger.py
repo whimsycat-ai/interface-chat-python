@@ -28,9 +28,13 @@ class LogStats:
 class Logger:
     """Logs requests and responses to JSONL files."""
     
+    # Maximum number of sessions to keep in memory cache
+    MAX_CACHED_SESSIONS = 50
+    
     def __init__(self, storage_dir: str):
         self.log_dir = Path(storage_dir) / "logs"
         self._logs: dict[str, list[LogEntry]] = {}
+        self._access_order: list[str] = []  # LRU tracking
         self._ensure_dir()
     
     def _ensure_dir(self) -> None:
@@ -81,9 +85,17 @@ class Logger:
     
     def _append_log(self, session_id: str, entry: LogEntry) -> None:
         """Append a log entry to cache and file."""
-        # Append to cache
+        # Append to cache with LRU eviction
         if session_id not in self._logs:
             self._logs[session_id] = []
+            self._access_order.append(session_id)
+            self._evict_if_needed()
+        else:
+            # Move to end (most recently used)
+            if session_id in self._access_order:
+                self._access_order.remove(session_id)
+            self._access_order.append(session_id)
+        
         self._logs[session_id].append(entry)
         
         # Append to file (JSONL format)
@@ -222,3 +234,15 @@ class Logger:
         # This would need proper serialization
         with open(output_path, "w") as f:
             json.dump([l.__dict__ for l in logs], f, indent=2, default=str)
+    
+    def _evict_if_needed(self) -> None:
+        """Evict oldest sessions from cache if over limit."""
+        while len(self._logs) > self.MAX_CACHED_SESSIONS:
+            if self._access_order:
+                oldest = self._access_order.pop(0)
+                self._logs.pop(oldest, None)
+    
+    def clear_cache(self) -> None:
+        """Clear the in-memory cache (logs remain on disk)."""
+        self._logs.clear()
+        self._access_order.clear()
