@@ -6,10 +6,10 @@ Handles authentication, sessions, logging, and memory.
 """
 
 import asyncio
-import os
 import time
 from pathlib import Path
 from typing import AsyncIterator, Any
+import os
 
 import anthropic
 
@@ -45,7 +45,8 @@ DEFAULT_MAX_TOKENS = 8192
 DEFAULT_STORAGE_DIR = Path.home() / ".claude-interface"
 
 # Claude Code stealth headers (for OAuth)
-CLAUDE_CODE_VERSION = "2.1.2"
+# Version can be overridden via environment variable
+CLAUDE_CODE_VERSION = os.getenv("CLAUDE_CODE_VERSION", "2.1.2")
 OAUTH_HEADERS = {
     "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
     "user-agent": f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)",
@@ -616,6 +617,13 @@ class ClaudeClient:
             if tools:
                 params["tools"] = tools
             
+            # Add thinking if enabled
+            if self._thinking:
+                params["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self._thinking_budget,
+                }
+            
             # Make API call
             response = await client.messages.create(**params)
             
@@ -854,6 +862,20 @@ class ClaudeClient:
         
         messages = self._convert_messages_for_api(session.messages)
         
+        # Log request (same as send())
+        request_id = ""
+        if self._enable_logging:
+            request_id = self._logger.log_request(
+                session.id,
+                RequestPayload(
+                    model=model,
+                    messages=session.messages,
+                    system_prompt=sys_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+            )
+        
         start_time = time.time()
         full_content = ""
         
@@ -898,16 +920,42 @@ class ClaudeClient:
                     timestamp=int(time.time() * 1000),
                 ))
             
+            # Build usage with cache tokens (same as send())
+            usage = Usage(
+                input_tokens=final_message.usage.input_tokens,
+                output_tokens=final_message.usage.output_tokens,
+                cache_read_tokens=getattr(final_message.usage, "cache_read_input_tokens", None),
+                cache_write_tokens=getattr(final_message.usage, "cache_creation_input_tokens", None),
+            )
+            
             result = SendResult(
                 content=full_content,
                 stop_reason=self._map_stop_reason(final_message.stop_reason),
-                usage=Usage(
-                    input_tokens=final_message.usage.input_tokens,
-                    output_tokens=final_message.usage.output_tokens,
-                ),
+                usage=usage,
                 duration_ms=duration_ms,
                 model=final_message.model,
             )
+            
+            # Update session metadata (same as send())
+            self._session_manager.update_metadata(session.id, {
+                "model": final_message.model,
+                "total_tokens": (session.metadata.get("total_tokens", 0) +
+                                usage.input_tokens + usage.output_tokens),
+            })
+            
+            # Log response (same as send())
+            if self._enable_logging:
+                self._logger.log_response(
+                    session.id,
+                    request_id,
+                    ResponsePayload(
+                        content=full_content,
+                        stop_reason=result.stop_reason,
+                        usage=usage,
+                        model=final_message.model,
+                    ),
+                    duration_ms,
+                )
             
             yield {"type": "done", "result": result}
             

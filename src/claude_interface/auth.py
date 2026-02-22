@@ -100,13 +100,21 @@ async def login(
     on_auth_url(auth_url)
     
     # Wait for authorization code
-    auth_code = await on_prompt_code()
-    parts = auth_code.split("#")
-    code = parts[0]
-    state = parts[1] if len(parts) > 1 else verifier
+    auth_code = (await on_prompt_code()).strip()
     
-    if not code:
-        raise ValueError("Invalid authorization code format. Expected: code#state")
+    # Validate format: code#state
+    if "#" not in auth_code:
+        raise ValueError(
+            "Invalid authorization code format. Expected: code#state\n"
+            "Copy the full code including the # and everything after it."
+        )
+    
+    code, state = auth_code.split("#", 1)
+    if not code or not state:
+        raise ValueError(
+            "Invalid authorization code format. Expected: code#state\n"
+            "Both code and state parts are required."
+        )
     
     # Exchange code for tokens
     async with httpx.AsyncClient() as client:

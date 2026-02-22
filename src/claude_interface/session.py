@@ -5,13 +5,17 @@ Handles saving, loading, and managing conversation sessions.
 """
 
 import json
-import os
 import time
+import logging
 from pathlib import Path
-from dataclasses import asdict, field
 from typing import Any
 
-from .types import Session, Message, MemoryEntry, SessionSummary
+from .types import Session, Message, MemoryEntry, SessionSummary, TextContent, ImageContent
+
+logger = logging.getLogger(__name__)
+
+# Maximum sessions to keep in memory cache
+MAX_CACHED_SESSIONS = 100
 
 
 class SessionManager:
@@ -20,6 +24,7 @@ class SessionManager:
     def __init__(self, storage_dir: str):
         self.session_dir = Path(storage_dir) / "sessions"
         self._sessions: dict[str, Session] = {}
+        self._access_order: list[str] = []  # LRU tracking
         self._ensure_dir()
     
     def _ensure_dir(self) -> None:
@@ -30,12 +35,75 @@ class SessionManager:
         """Get file path for a session."""
         return self.session_dir / f"{session_id}.json"
     
+    def _touch_cache(self, session_id: str) -> None:
+        """Update LRU order for a session."""
+        if session_id in self._access_order:
+            self._access_order.remove(session_id)
+        self._access_order.append(session_id)
+    
+    def _evict_if_needed(self) -> None:
+        """Evict oldest sessions from cache if over limit."""
+        while len(self._sessions) > MAX_CACHED_SESSIONS:
+            if self._access_order:
+                oldest = self._access_order.pop(0)
+                self._sessions.pop(oldest, None)
+    
+    def clear_cache(self) -> None:
+        """Clear the in-memory session cache."""
+        self._sessions.clear()
+        self._access_order.clear()
+    
     def generate_id(self) -> str:
         """Generate a unique session ID."""
         import secrets
         timestamp = hex(int(time.time()))[2:]
         random_part = secrets.token_hex(3)
         return f"session_{timestamp}_{random_part}"
+    
+    def _serialize_content(self, content: str | list) -> str | list[dict]:
+        """Serialize message content to JSON-compatible format."""
+        if isinstance(content, str):
+            return content
+        
+        # Handle list of ContentBlocks
+        result = []
+        for block in content:
+            if isinstance(block, TextContent):
+                result.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContent):
+                result.append({
+                    "type": "image",
+                    "media_type": block.media_type,
+                    "data": block.data,
+                })
+            elif isinstance(block, dict):
+                result.append(block)
+            else:
+                # Fallback for unknown types
+                result.append({"type": "unknown", "data": str(block)})
+        return result
+    
+    def _deserialize_content(self, content: str | list) -> str | list:
+        """Deserialize message content from JSON."""
+        if isinstance(content, str):
+            return content
+        
+        # Handle list of dicts -> ContentBlocks
+        result = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    result.append(TextContent(text=block.get("text", "")))
+                elif block.get("type") == "image":
+                    result.append(ImageContent(
+                        media_type=block.get("media_type", "image/png"),
+                        data=block.get("data", ""),
+                    ))
+                else:
+                    result.append(block)
+            else:
+                result.append(block)
+        return result
     
     def create(
         self,
@@ -58,12 +126,15 @@ class SessionManager:
         )
         
         self._sessions[session.id] = session
+        self._touch_cache(session.id)
+        self._evict_if_needed()
         self.save(session.id)
         return session
     
     def get(self, session_id: str) -> Session | None:
         """Get a session by ID, loading from disk if necessary."""
         if session_id in self._sessions:
+            self._touch_cache(session_id)
             return self._sessions[session_id]
         return self.load(session_id)
     
@@ -81,7 +152,7 @@ class SessionManager:
             messages = [
                 Message(
                     role=m["role"],
-                    content=m["content"],
+                    content=self._deserialize_content(m["content"]),
                     timestamp=m.get("timestamp"),
                 )
                 for m in data.get("messages", [])
@@ -111,9 +182,11 @@ class SessionManager:
             )
             
             self._sessions[session_id] = session
+            self._touch_cache(session_id)
+            self._evict_if_needed()
             return session
         except Exception as e:
-            print(f"Failed to load session {session_id}: {e}")
+            logger.error(f"Failed to load session {session_id}: {e}")
             return None
     
     def save(self, session_id: str) -> None:
@@ -131,7 +204,11 @@ class SessionManager:
             "name": session.name,
             "system_prompt": session.system_prompt,
             "messages": [
-                {"role": m.role, "content": m.content, "timestamp": m.timestamp}
+                {
+                    "role": m.role,
+                    "content": self._serialize_content(m.content),
+                    "timestamp": m.timestamp,
+                }
                 for m in session.messages
             ],
             "metadata": session.metadata,
@@ -205,6 +282,8 @@ class SessionManager:
     def delete(self, session_id: str) -> bool:
         """Delete a session."""
         self._sessions.pop(session_id, None)
+        if session_id in self._access_order:
+            self._access_order.remove(session_id)
         session_path = self._get_session_path(session_id)
         if session_path.exists():
             session_path.unlink()
@@ -258,8 +337,37 @@ class SessionManager:
         if not session:
             raise ValueError(f"Session {session_id} not found")
         
+        # Build explicit JSON-serializable representation
+        data = {
+            "id": session.id,
+            "name": session.name,
+            "system_prompt": session.system_prompt,
+            "metadata": session.metadata,
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+            "messages": [
+                {
+                    "role": m.role,
+                    "content": self._serialize_content(m.content),
+                    "timestamp": m.timestamp,
+                }
+                for m in session.messages
+            ],
+            "memory": [
+                {
+                    "id": mem.id,
+                    "content": mem.content,
+                    "type": mem.type,
+                    "tags": list(mem.tags),
+                    "created_at": mem.created_at,
+                    "priority": mem.priority,
+                }
+                for mem in session.memory
+            ],
+        }
+        
         with open(output_path, "w") as f:
-            json.dump(asdict(session), f, indent=2)
+            json.dump(data, f, indent=2)
     
     def import_session(self, input_path: str, new_id: str | None = None) -> Session:
         """Import a session from a file."""
@@ -278,7 +386,11 @@ class SessionManager:
         
         # Load messages and memory from imported data
         session.messages = [
-            Message(role=m["role"], content=m["content"], timestamp=m.get("timestamp"))
+            Message(
+                role=m["role"],
+                content=self._deserialize_content(m["content"]),
+                timestamp=m.get("timestamp"),
+            )
             for m in data.get("messages", [])
         ]
         session.memory = [

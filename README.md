@@ -36,9 +36,7 @@ async def main():
     # Interactive login
     credentials = await login(
         on_auth_url=lambda url: print(f"\nOpen this URL:\n{url}\n"),
-        on_prompt_code=lambda: asyncio.get_event_loop().run_in_executor(
-            None, input, "Paste authorization code: "
-        ),
+        on_prompt_code=lambda: asyncio.to_thread(input, "Paste authorization code: "),
     )
     
     # Create client with OAuth

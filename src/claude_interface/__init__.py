@@ -3,28 +3,32 @@ Claude Interface - Lightweight Claude API interface with OAuth support.
 
 Example:
     ```python
+    import asyncio
     from claude_interface import ClaudeClient, AuthConfig, login
     
-    # Login with OAuth (Claude Pro/Max)
-    credentials = await login(
-        on_auth_url=lambda url: print(f"Open: {url}"),
-        on_prompt_code=lambda: input("Code: "),
-    )
+    async def main():
+        # Login with OAuth (Claude Pro/Max)
+        credentials = await login(
+            on_auth_url=lambda url: print(f"Open: {url}"),
+            on_prompt_code=lambda: asyncio.to_thread(input, "Code: "),
+        )
+        
+        # Create client
+        client = ClaudeClient(auth=AuthConfig(oauth=credentials))
+        
+        # Create session and chat
+        client.create_session(name="Code Review")
+        result = await client.send("Review this code...")
+        print(result.content)
+        
+        # Send with image
+        from claude_interface import ImageInput
+        result = await client.send(
+            "What's in this image?",
+            images=[ImageInput.from_file("photo.png")],
+        )
     
-    # Create client
-    client = ClaudeClient(auth=AuthConfig(oauth=credentials))
-    
-    # Create session and chat
-    client.create_session(name="Code Review")
-    result = await client.send("Review this code...")
-    print(result.content)
-    
-    # Send with image
-    from claude_interface import ImageInput
-    result = await client.send(
-        "What's in this image?",
-        images=[ImageInput.from_file("photo.png")],
-    )
+    asyncio.run(main())
     ```
 """
 

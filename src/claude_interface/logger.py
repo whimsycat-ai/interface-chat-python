@@ -10,7 +10,7 @@ import secrets
 from pathlib import Path
 from dataclasses import dataclass
 
-from .types import LogEntry, RequestPayload, ResponsePayload, Message, Usage
+from .types import LogEntry, RequestPayload, ResponsePayload, Message, Usage, TextContent, ImageContent
 
 
 @dataclass
@@ -114,7 +114,7 @@ class Logger:
             entry_dict["payload"] = {
                 "model": entry.payload.model,
                 "messages": [
-                    {"role": m.role, "content": m.content}
+                    {"role": m.role, "content": self._serialize_content(m.content)}
                     for m in entry.payload.messages
                 ],
                 "system_prompt": entry.payload.system_prompt,
@@ -228,12 +228,71 @@ class Logger:
         if log_path.exists():
             log_path.unlink()
     
+    def _serialize_content(self, content: str | list) -> str | list[dict]:
+        """Serialize message content to JSON-compatible format."""
+        if isinstance(content, str):
+            return content
+        
+        result = []
+        for block in content:
+            if isinstance(block, TextContent):
+                result.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContent):
+                result.append({
+                    "type": "image",
+                    "media_type": block.media_type,
+                    "data": block.data,
+                })
+            elif isinstance(block, dict):
+                result.append(block)
+            else:
+                result.append({"type": "unknown", "data": str(block)})
+        return result
+    
     def export_logs(self, session_id: str, output_path: str) -> None:
         """Export logs to a single JSON file."""
         logs = self.get_logs(session_id)
-        # This would need proper serialization
+        
+        # Properly serialize log entries
+        serialized = []
+        for log in logs:
+            entry = {
+                "id": log.id,
+                "session_id": log.session_id,
+                "timestamp": log.timestamp,
+                "direction": log.direction,
+                "duration_ms": log.duration_ms,
+            }
+            
+            if isinstance(log.payload, RequestPayload):
+                entry["payload"] = {
+                    "type": "request",
+                    "model": log.payload.model,
+                    "messages": [
+                        {"role": m.role, "content": self._serialize_content(m.content)}
+                        for m in log.payload.messages
+                    ],
+                    "system_prompt": log.payload.system_prompt,
+                    "max_tokens": log.payload.max_tokens,
+                    "temperature": log.payload.temperature,
+                }
+            else:
+                entry["payload"] = {
+                    "type": "response",
+                    "content": log.payload.content,
+                    "stop_reason": log.payload.stop_reason,
+                    "usage": {
+                        "input_tokens": log.payload.usage.input_tokens,
+                        "output_tokens": log.payload.usage.output_tokens,
+                        "cache_read_tokens": log.payload.usage.cache_read_tokens,
+                        "cache_write_tokens": log.payload.usage.cache_write_tokens,
+                    },
+                    "model": log.payload.model,
+                }
+            serialized.append(entry)
+        
         with open(output_path, "w") as f:
-            json.dump([l.__dict__ for l in logs], f, indent=2, default=str)
+            json.dump(serialized, f, indent=2)
     
     def _evict_if_needed(self) -> None:
         """Evict oldest sessions from cache if over limit."""

@@ -9,7 +9,7 @@ description = "Lightweight Claude API interface with OAuth support, session mana
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Thalpy", email = "thalpy@example.com"}
+    {name = "Thalpy"}
 ]
 requires-python = ">=3.10"
 classifiers = [
