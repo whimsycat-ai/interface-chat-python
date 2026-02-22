@@ -104,9 +104,16 @@ class TestGetMessages:
 
 class TestList:
     def test_lists_sessions_sorted_by_updated(self, manager):
-        manager.create(id="list-1", name="First")
-        import time; time.sleep(0.01)
-        manager.create(id="list-2", name="Second")
+        session1 = manager.create(id="list-1", name="First")
+        session2 = manager.create(id="list-2", name="Second")
+        
+        # Explicitly set timestamps (ms since epoch) to ensure deterministic ordering
+        earlier_ts = 1000000000000  # Some arbitrary timestamp
+        later_ts = earlier_ts + 10000  # 10 seconds later
+        session1.updated_at = earlier_ts
+        session2.updated_at = later_ts
+        manager.save("list-1")
+        manager.save("list-2")
 
         sessions = manager.list()
         assert len(sessions) == 2

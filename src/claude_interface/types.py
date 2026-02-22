@@ -33,6 +33,11 @@ class AuthConfig:
 Role = Literal["user", "assistant"]
 
 
+# Supported image media types
+ImageMediaType = Literal["image/jpeg", "image/png", "image/gif", "image/webp"]
+SUPPORTED_IMAGE_TYPES: set[ImageMediaType] = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
 @dataclass
 class TextContent:
     """Text content block."""
@@ -44,7 +49,7 @@ class TextContent:
 class ImageContent:
     """Image content block."""
     type: Literal["image"] = "image"
-    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/png"
+    media_type: ImageMediaType = "image/png"
     data: str = ""  # Base64 encoded
 
 
@@ -227,7 +232,7 @@ class SpinOutOptions:
 class ImageInput:
     """Helper for creating image content."""
     data: str  # Base64 encoded or file path
-    media_type: Literal["image/jpeg", "image/png", "image/gif", "image/webp"] = "image/png"
+    media_type: ImageMediaType = "image/png"
     
     @classmethod
     def from_file(cls, path: str) -> "ImageInput":
@@ -238,7 +243,7 @@ class ImageInput:
         file_path = Path(path)
         suffix = file_path.suffix.lower()
         
-        media_type_map = {
+        media_type_map: dict[str, ImageMediaType] = {
             ".jpg": "image/jpeg",
             ".jpeg": "image/jpeg",
             ".png": "image/png",
@@ -254,7 +259,7 @@ class ImageInput:
         return cls(data=data, media_type=media_type)
     
     @classmethod
-    def from_base64(cls, data: str, media_type: str = "image/png") -> "ImageInput":
+    def from_base64(cls, data: str, media_type: ImageMediaType = "image/png") -> "ImageInput":
         """Create ImageInput from base64 data."""
         return cls(data=data, media_type=media_type)
     
@@ -271,5 +276,12 @@ class ImageInput:
         if ";" in content_type:
             content_type = content_type.split(";")[0].strip()
         
+        # Validate content-type is a supported image type
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            content_type = "image/png"  # Default to PNG for unsupported types
+        
+        # Cast to ImageMediaType after validation
+        media_type: ImageMediaType = content_type  # type: ignore[assignment]
+        
         data = base64.b64encode(response.content).decode("utf-8")
-        return cls(data=data, media_type=content_type)
+        return cls(data=data, media_type=media_type)

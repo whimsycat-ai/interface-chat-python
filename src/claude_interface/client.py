@@ -98,7 +98,7 @@ class ClaudeClient:
         self._oauth_credentials = auth.oauth
         self._current_session_id: str | None = None
         
-        # Lock for thread-safe session operations
+        # Async lock for coroutine-safe session operations
         self._session_lock = asyncio.Lock()
         
         self._session_manager = SessionManager(str(self._storage_dir))
@@ -252,7 +252,7 @@ class ClaudeClient:
                 result = tool.handler(**tool_call.input)
             return str(result)
         except Exception as e:
-            return f"Error executing tool: {e}"
+            return f"Error executing tool ({type(e).__name__}): {e}"
     
     # ─────────────────────────────────────────────────────────────────────────
     # Session Management
@@ -442,7 +442,7 @@ class ClaudeClient:
         sys_prompt = override or session.system_prompt or ""
         
         # For OAuth, prepend required Claude Code identity
-        if is_oauth and "Claude Code" not in sys_prompt:
+        if is_oauth and "claude code" not in sys_prompt.lower():
             sys_prompt = "You are Claude Code, Anthropic's official CLI for Claude.\n\n" + sys_prompt
         
         # Add memory context
@@ -721,8 +721,20 @@ class ClaudeClient:
         max_tokens: int,
         temperature: float | None,
         system_prompt: str,
+        current_depth: int = 0,
+        max_tool_depth: int = 10,
     ) -> SendResult:
         """Execute tool calls and continue the conversation."""
+        if current_depth >= max_tool_depth:
+            return SendResult(
+                content=f"Error: Maximum tool recursion depth ({max_tool_depth}) exceeded",
+                stop_reason="error",
+                usage=Usage(),
+                duration_ms=0,
+                model=model,
+                tool_calls=[],
+            )
+        
         session = self.get_current_session()
         if not session:
             raise ValueError("No active session")
@@ -819,7 +831,8 @@ class ClaudeClient:
         # Recursively handle more tool calls
         if new_tool_calls and result.stop_reason == "tool_use":
             return await self._execute_tools_and_continue(
-                new_tool_calls, model, max_tokens, temperature, system_prompt
+                new_tool_calls, model, max_tokens, temperature, system_prompt,
+                current_depth + 1, max_tool_depth
             )
         
         return result

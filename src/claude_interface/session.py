@@ -5,6 +5,8 @@ Handles saving, loading, and managing conversation sessions.
 """
 
 import json
+import os
+import tempfile
 import time
 import logging
 from pathlib import Path
@@ -17,14 +19,45 @@ logger = logging.getLogger(__name__)
 # Maximum sessions to keep in memory cache
 MAX_CACHED_SESSIONS = 100
 
+# Required fields for session schema validation
+REQUIRED_SESSION_FIELDS = {"id"}
+VALID_MESSAGE_ROLES = {"user", "assistant", "system"}
+
+
+class SessionLoadError(Exception):
+    """Raised when a session fails to load."""
+    
+    def __init__(self, session_id: str, reason: str, original_error: Exception | None = None):
+        self.session_id = session_id
+        self.reason = reason
+        self.original_error = original_error
+        super().__init__(f"Failed to load session '{session_id}': {reason}")
+
+
+class SessionValidationError(Exception):
+    """Raised when session data fails validation."""
+    
+    def __init__(self, message: str, field: str | None = None):
+        self.field = field
+        super().__init__(message)
+
+
+class PathSecurityError(Exception):
+    """Raised when a path fails security validation."""
+    pass
+
 
 class SessionManager:
     """Manages conversation sessions with file persistence."""
     
-    def __init__(self, storage_dir: str):
+    def __init__(self, storage_dir: str, allowed_export_dirs: list[str] | None = None):
         self.session_dir = Path(storage_dir) / "sessions"
         self._sessions: dict[str, Session] = {}
         self._access_order: list[str] = []  # LRU tracking
+        # Directories where export/import is allowed (defaults to session_dir parent)
+        self._allowed_dirs = [Path(storage_dir).resolve()]
+        if allowed_export_dirs:
+            self._allowed_dirs.extend(Path(d).resolve() for d in allowed_export_dirs)
         self._ensure_dir()
     
     def _ensure_dir(self) -> None:
@@ -34,6 +67,128 @@ class SessionManager:
     def _get_session_path(self, session_id: str) -> Path:
         """Get file path for a session."""
         return self.session_dir / f"{session_id}.json"
+    
+    def _validate_path_security(self, path: str, operation: str) -> Path:
+        """
+        Validate that a path is safe for file operations.
+        
+        Prevents path traversal attacks by ensuring the resolved path
+        is within allowed directories.
+        
+        Args:
+            path: The path to validate
+            operation: Description of operation (for error messages)
+            
+        Returns:
+            Resolved Path object
+            
+        Raises:
+            PathSecurityError: If path is outside allowed directories
+        """
+        try:
+            resolved = Path(path).resolve()
+        except (OSError, ValueError) as e:
+            raise PathSecurityError(f"Invalid path for {operation}: {e}")
+        
+        # Check if path is within any allowed directory
+        for allowed_dir in self._allowed_dirs:
+            try:
+                resolved.relative_to(allowed_dir)
+                return resolved
+            except ValueError:
+                continue
+        
+        raise PathSecurityError(
+            f"Path '{path}' is outside allowed directories for {operation}. "
+            f"Allowed: {[str(d) for d in self._allowed_dirs]}"
+        )
+    
+    def _validate_session_schema(self, data: dict, source: str = "data") -> None:
+        """
+        Validate imported session data against expected schema.
+        
+        Args:
+            data: The session data dict to validate
+            source: Description of data source (for error messages)
+            
+        Raises:
+            SessionValidationError: If data fails validation
+        """
+        if not isinstance(data, dict):
+            raise SessionValidationError(f"Session {source} must be a JSON object")
+        
+        # Check required fields
+        for field in REQUIRED_SESSION_FIELDS:
+            if field not in data:
+                raise SessionValidationError(
+                    f"Missing required field '{field}' in session {source}",
+                    field=field
+                )
+        
+        # Validate id is a non-empty string
+        if not isinstance(data.get("id"), str) or not data["id"].strip():
+            raise SessionValidationError(
+                "Session 'id' must be a non-empty string",
+                field="id"
+            )
+        
+        # Validate messages array if present
+        messages = data.get("messages", [])
+        if not isinstance(messages, list):
+            raise SessionValidationError(
+                "'messages' must be an array",
+                field="messages"
+            )
+        
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                raise SessionValidationError(
+                    f"Message at index {i} must be an object",
+                    field=f"messages[{i}]"
+                )
+            if "role" not in msg:
+                raise SessionValidationError(
+                    f"Message at index {i} missing 'role' field",
+                    field=f"messages[{i}].role"
+                )
+            if msg["role"] not in VALID_MESSAGE_ROLES:
+                raise SessionValidationError(
+                    f"Message at index {i} has invalid role '{msg['role']}'. "
+                    f"Valid roles: {VALID_MESSAGE_ROLES}",
+                    field=f"messages[{i}].role"
+                )
+            if "content" not in msg:
+                raise SessionValidationError(
+                    f"Message at index {i} missing 'content' field",
+                    field=f"messages[{i}].content"
+                )
+        
+        # Validate memory array if present
+        memory = data.get("memory", [])
+        if not isinstance(memory, list):
+            raise SessionValidationError(
+                "'memory' must be an array",
+                field="memory"
+            )
+        
+        for i, mem in enumerate(memory):
+            if not isinstance(mem, dict):
+                raise SessionValidationError(
+                    f"Memory entry at index {i} must be an object",
+                    field=f"memory[{i}]"
+                )
+            if "id" not in mem or "content" not in mem:
+                raise SessionValidationError(
+                    f"Memory entry at index {i} missing required 'id' or 'content' field",
+                    field=f"memory[{i}]"
+                )
+        
+        # Validate metadata is a dict if present
+        if "metadata" in data and not isinstance(data["metadata"], dict):
+            raise SessionValidationError(
+                "'metadata' must be an object",
+                field="metadata"
+            )
     
     def _touch_cache(self, session_id: str) -> None:
         """Update LRU order for a session."""
@@ -139,7 +294,18 @@ class SessionManager:
         return self.load(session_id)
     
     def load(self, session_id: str) -> Session | None:
-        """Load a session from disk."""
+        """
+        Load a session from disk.
+        
+        Args:
+            session_id: The session ID to load
+            
+        Returns:
+            The loaded Session, or None if not found
+            
+        Raises:
+            SessionLoadError: If the session file exists but cannot be loaded
+        """
         session_path = self._get_session_path(session_id)
         if not session_path.exists():
             return None
@@ -147,6 +313,32 @@ class SessionManager:
         try:
             with open(session_path, "r") as f:
                 data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise SessionLoadError(
+                session_id,
+                f"Invalid JSON at line {e.lineno}, column {e.colno}: {e.msg}",
+                original_error=e
+            )
+        except PermissionError as e:
+            raise SessionLoadError(
+                session_id,
+                f"Permission denied reading session file",
+                original_error=e
+            )
+        except OSError as e:
+            raise SessionLoadError(
+                session_id,
+                f"I/O error reading session file: {e.strerror}",
+                original_error=e
+            )
+        
+        try:
+            # Validate required fields
+            if "id" not in data:
+                raise SessionLoadError(
+                    session_id,
+                    "Session file missing required 'id' field"
+                )
             
             # Convert dicts back to dataclass instances
             messages = [
@@ -185,12 +377,27 @@ class SessionManager:
             self._touch_cache(session_id)
             self._evict_if_needed()
             return session
-        except Exception as e:
-            logger.error(f"Failed to load session {session_id}: {e}")
-            return None
+            
+        except KeyError as e:
+            raise SessionLoadError(
+                session_id,
+                f"Missing required field in message or memory: {e}",
+                original_error=e
+            )
+        except TypeError as e:
+            raise SessionLoadError(
+                session_id,
+                f"Invalid data type in session structure: {e}",
+                original_error=e
+            )
     
     def save(self, session_id: str) -> None:
-        """Save a session to disk."""
+        """
+        Save a session to disk atomically.
+        
+        Uses write-to-temp-then-rename pattern to prevent corruption
+        on disk full or permission errors.
+        """
         session = self._sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
@@ -227,8 +434,35 @@ class SessionManager:
             "updated_at": session.updated_at,
         }
         
-        with open(session_path, "w") as f:
-            json.dump(data, f, indent=2)
+        # Atomic write: write to temp file, then rename
+        # This prevents corruption if disk is full or write is interrupted
+        temp_fd = None
+        temp_path = None
+        try:
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=self.session_dir,
+                prefix=f".{session_id}_",
+                suffix=".tmp"
+            )
+            with os.fdopen(temp_fd, "w") as f:
+                temp_fd = None  # os.fdopen takes ownership
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+            
+            # Atomic rename (on POSIX systems)
+            os.replace(temp_path, session_path)
+            temp_path = None  # Successfully moved, don't delete
+            
+        finally:
+            # Clean up temp file if something went wrong
+            if temp_fd is not None:
+                os.close(temp_fd)
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
     
     def add_message(self, session_id: str, message: Message) -> None:
         """Add a message to a session."""
@@ -332,7 +566,20 @@ class SessionManager:
         self.save(session_id)
     
     def export(self, session_id: str, output_path: str) -> None:
-        """Export a session to a file."""
+        """
+        Export a session to a file.
+        
+        Args:
+            session_id: The session ID to export
+            output_path: Path to write the exported JSON
+            
+        Raises:
+            ValueError: If session not found
+            PathSecurityError: If output_path is outside allowed directories
+        """
+        # Validate path security before proceeding
+        validated_path = self._validate_path_security(output_path, "export")
+        
         session = self.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
@@ -366,13 +613,65 @@ class SessionManager:
             ],
         }
         
-        with open(output_path, "w") as f:
-            json.dump(data, f, indent=2)
+        # Use atomic write for export as well
+        temp_fd = None
+        temp_path = None
+        try:
+            temp_fd, temp_path = tempfile.mkstemp(
+                dir=validated_path.parent,
+                prefix=".export_",
+                suffix=".tmp"
+            )
+            with os.fdopen(temp_fd, "w") as f:
+                temp_fd = None
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            os.replace(temp_path, validated_path)
+            temp_path = None
+            
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
     
     def import_session(self, input_path: str, new_id: str | None = None) -> Session:
-        """Import a session from a file."""
-        with open(input_path, "r") as f:
-            data = json.load(f)
+        """
+        Import a session from a file.
+        
+        Args:
+            input_path: Path to the JSON file to import
+            new_id: Optional new ID for the imported session
+            
+        Returns:
+            The imported Session
+            
+        Raises:
+            PathSecurityError: If input_path is outside allowed directories
+            SessionValidationError: If the imported data fails schema validation
+            FileNotFoundError: If the input file doesn't exist
+        """
+        # Validate path security before proceeding
+        validated_path = self._validate_path_security(input_path, "import")
+        
+        if not validated_path.exists():
+            raise FileNotFoundError(f"Import file not found: {input_path}")
+        
+        try:
+            with open(validated_path, "r") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise SessionValidationError(
+                f"Invalid JSON in import file at line {e.lineno}: {e.msg}"
+            )
+        
+        # Validate the imported data schema
+        self._validate_session_schema(data, source=f"file '{input_path}'")
         
         if new_id:
             data["id"] = new_id

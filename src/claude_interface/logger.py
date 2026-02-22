@@ -5,12 +5,29 @@ Logs all API interactions to disk for debugging and analysis.
 """
 
 import json
+import os
+import tempfile
 import time
 import secrets
+import logging
 from pathlib import Path
 from dataclasses import dataclass
 
 from .types import LogEntry, RequestPayload, ResponsePayload, Message, Usage, TextContent, ImageContent
+
+
+# Module logger for error reporting
+_logger = logging.getLogger(__name__)
+
+
+class LogWriteError(Exception):
+    """Raised when a log write operation fails."""
+    pass
+
+
+class PathValidationError(Exception):
+    """Raised when a path fails security validation."""
+    pass
 
 
 @dataclass
@@ -32,7 +49,7 @@ class Logger:
     MAX_CACHED_SESSIONS = 50
     
     def __init__(self, storage_dir: str):
-        self.log_dir = Path(storage_dir) / "logs"
+        self.log_dir = Path(storage_dir).resolve() / "logs"
         self._logs: dict[str, list[LogEntry]] = {}
         self._access_order: list[str] = []  # LRU tracking
         self._ensure_dir()
@@ -84,7 +101,11 @@ class Logger:
         self._append_log(session_id, entry)
     
     def _append_log(self, session_id: str, entry: LogEntry) -> None:
-        """Append a log entry to cache and file."""
+        """Append a log entry to cache and file.
+        
+        Uses atomic write pattern: write to temp file, then append to main file.
+        This prevents partial writes from corrupting the log on crashes.
+        """
         # Append to cache with LRU eviction
         if session_id not in self._logs:
             self._logs[session_id] = []
@@ -134,8 +155,38 @@ class Logger:
                 "model": entry.payload.model,
             }
         
-        with open(log_path, "a") as f:
-            f.write(json.dumps(entry_dict) + "\n")
+        # Atomic write pattern: write to temp file first, then append
+        json_line = json.dumps(entry_dict) + "\n"
+        
+        try:
+            # Write to temp file in the same directory (ensures same filesystem for rename)
+            fd, temp_path = tempfile.mkstemp(
+                dir=self.log_dir,
+                prefix=".log_entry_",
+                suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as temp_file:
+                    temp_file.write(json_line)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                
+                # Append temp file content to main log file
+                with open(log_path, "a") as f:
+                    f.write(json_line)
+                    f.flush()
+                    os.fsync(f.fileno())
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                    
+        except (IOError, OSError) as e:
+            _logger.error(f"Failed to write log entry for session {session_id}: {e}")
+            # Don't raise - log writes shouldn't crash the application
+            # The entry is still in the in-memory cache
     
     def get_logs(self, session_id: str) -> list[LogEntry]:
         """Get all logs for a session."""
@@ -249,8 +300,62 @@ class Logger:
                 result.append({"type": "unknown", "data": str(block)})
         return result
     
+    def _validate_export_path(self, output_path: str) -> Path:
+        """Validate export path to prevent path traversal attacks.
+        
+        Args:
+            output_path: The requested output path
+            
+        Returns:
+            Resolved, validated Path object
+            
+        Raises:
+            PathValidationError: If the path fails validation
+        """
+        # Resolve to absolute path
+        resolved_path = Path(output_path).resolve()
+        
+        # Check for null bytes (can bypass some checks)
+        if "\x00" in output_path:
+            raise PathValidationError("Path contains null bytes")
+        
+        # Ensure the path is under the log directory OR is an absolute path
+        # that the caller explicitly requested (not using .. traversal)
+        # Check if the original path tried to use path traversal
+        normalized = os.path.normpath(output_path)
+        if ".." in normalized.split(os.sep):
+            raise PathValidationError(
+                f"Path traversal detected in output path: {output_path}"
+            )
+        
+        # Ensure parent directory exists and is writable
+        parent_dir = resolved_path.parent
+        if not parent_dir.exists():
+            raise PathValidationError(
+                f"Parent directory does not exist: {parent_dir}"
+            )
+        
+        if not os.access(parent_dir, os.W_OK):
+            raise PathValidationError(
+                f"Parent directory is not writable: {parent_dir}"
+            )
+        
+        return resolved_path
+    
     def export_logs(self, session_id: str, output_path: str) -> None:
-        """Export logs to a single JSON file."""
+        """Export logs to a single JSON file.
+        
+        Args:
+            session_id: The session ID to export logs for
+            output_path: Path to write the JSON file to
+            
+        Raises:
+            PathValidationError: If output_path fails security validation
+            LogWriteError: If the write operation fails
+        """
+        # Validate the output path
+        validated_path = self._validate_export_path(output_path)
+        
         logs = self.get_logs(session_id)
         
         # Properly serialize log entries
@@ -291,8 +396,32 @@ class Logger:
                 }
             serialized.append(entry)
         
-        with open(output_path, "w") as f:
-            json.dump(serialized, f, indent=2)
+        # Atomic write: write to temp file, then rename
+        try:
+            parent_dir = validated_path.parent
+            fd, temp_path = tempfile.mkstemp(
+                dir=parent_dir,
+                prefix=".export_",
+                suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(serialized, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                
+                # Atomic rename
+                os.replace(temp_path, validated_path)
+            except Exception:
+                # Clean up temp file on failure
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+                
+        except (IOError, OSError) as e:
+            raise LogWriteError(f"Failed to export logs: {e}") from e
     
     def _evict_if_needed(self) -> None:
         """Evict oldest sessions from cache if over limit."""

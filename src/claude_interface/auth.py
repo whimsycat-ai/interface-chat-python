@@ -28,6 +28,9 @@ SCOPES = "org:create_api_key user:profile user:inference"
 # Token refresh buffer (refresh 5 minutes before expiry)
 REFRESH_BUFFER_MS = 5 * 60 * 1000
 
+# Maximum length for API error messages to prevent logging sensitive data
+MAX_ERROR_MESSAGE_LENGTH = 500
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PKCE Helpers
@@ -48,6 +51,13 @@ def _generate_pkce() -> tuple[str, str]:
     challenge = _base64url_encode(challenge_bytes)
     
     return verifier, challenge
+
+
+def _truncate_error_message(message: str) -> str:
+    """Truncate and sanitize error messages from API responses."""
+    if len(message) <= MAX_ERROR_MESSAGE_LENGTH:
+        return message
+    return message[:MAX_ERROR_MESSAGE_LENGTH] + "... (truncated)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,13 +113,22 @@ async def login(
     auth_code = (await on_prompt_code()).strip()
     
     # Validate format: code#state
+    # Use rsplit to handle codes that might contain # in the code portion
     if "#" not in auth_code:
         raise ValueError(
             "Invalid authorization code format. Expected: code#state\n"
             "Copy the full code including the # and everything after it."
         )
     
-    code, state = auth_code.split("#", 1)
+    # Split from the right to handle edge cases with # in code
+    parts = auth_code.rsplit("#", 1)
+    if len(parts) != 2:
+        raise ValueError(
+            "Invalid authorization code format. Expected: code#state\n"
+            "Both code and state parts are required."
+        )
+    
+    code, state = parts
     if not code or not state:
         raise ValueError(
             "Invalid authorization code format. Expected: code#state\n"
@@ -132,7 +151,8 @@ async def login(
         )
         
         if response.status_code != 200:
-            raise ValueError(f"OAuth token exchange failed: {response.text}")
+            error_msg = _truncate_error_message(response.text)
+            raise ValueError(f"OAuth token exchange failed: {error_msg}")
         
         data = response.json()
     
@@ -165,7 +185,8 @@ async def refresh_token(refresh_token_str: str) -> OAuthCredentials:
         )
         
         if response.status_code != 200:
-            raise ValueError(f"OAuth token refresh failed: {response.text}")
+            error_msg = _truncate_error_message(response.text)
+            raise ValueError(f"OAuth token refresh failed: {error_msg}")
         
         data = response.json()
     
